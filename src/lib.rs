@@ -13,9 +13,10 @@ use serde::{Deserialize, Deserializer};
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256};
 
-use crate::signature::Signature;
-use crate::ticket_data::TicketData;
-use crate::version::Version;
+// Re-export as well for convenience
+pub use crate::signature::Signature;
+pub use crate::ticket_data::TicketData;
+pub use crate::version::Version;
 
 mod signature;
 mod ticket_data;
