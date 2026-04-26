@@ -5,7 +5,7 @@
 
 use base64::Engine;
 use ecdsa::elliptic_curve::pkcs8::DecodePublicKey;
-use ecdsa::signature::hazmat::PrehashVerifier;
+use ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use p192::NistP192;
 use p224::NistP224;
 use p256::NistP256;
@@ -13,117 +13,19 @@ use serde::{Deserialize, Deserializer};
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256};
 
+use crate::signature::Signature;
+use crate::ticket_data::TicketData;
+use crate::version::Version;
+
+mod signature;
+mod ticket_data;
+mod version;
+
 /// Default domain RPCN sets for players.
 pub const DEFAULT_DOMAIN: &str = "un";
 
 /// Default region RPCN sets for players.
 pub const DEFAULT_REGION: &str = "br";
-
-/// The version of the ticket format.
-///
-/// It's either:
-/// - 0x2100 for Version 2.0
-/// - 0x2101 for Version 2.1
-/// - 0x3100 for Version 3.0
-/// - 0x4100 for Version 4.0
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Version {
-    /// Version 2.0
-    V2 = 0x2100,
-
-    /// Version 2.1
-    V2_1 = 0x2101,
-
-    /// Version 3.0
-    V3 = 0x3100,
-
-    /// Version 4.0
-    V4 = 0x4100,
-}
-
-impl Version {
-    /// Get the version from a u16.
-    pub const fn from_u16(version: u16) -> Option<Self> {
-        match version {
-            0x2100 => Some(Self::V2),
-            0x2101 => Some(Self::V2_1),
-            0x3100 => Some(Self::V3),
-            0x4100 => Some(Self::V4),
-            _ => None,
-        }
-    }
-
-    /// Get the expected length of the ticket for this version.
-    pub const fn ticket_length(self) -> usize {
-        match self {
-            Self::V2 | Self::V2_1 => 212,
-            Self::V3 => 220,
-            Self::V4 => 320,
-        }
-    }
-
-    /// Length of the signature.
-    pub fn signature_length(self, signature: &Signature) -> usize {
-        match signature {
-            // PS3 uses SHA-1 for V2 to V3, and SHA-256 for V4.
-            Signature::Console(_) => match self {
-                Self::V2 | Self::V2_1 | Self::V3 => 16,
-                Self::V4 => 32,
-            },
-
-            Signature::Emulator(_) => unimplemented!(),
-        }
-    }
-}
-
-/// The signature ID of the ticket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Signature {
-    /// ``PlayStation Network``, real PS3
-    Console(Vec<u8>),
-
-    /// ``RPCN``, RPCS3 emulator
-    Emulator(Vec<u8>),
-}
-
-impl Default for Signature {
-    fn default() -> Self {
-        Self::Emulator(Vec::new())
-    }
-}
-
-impl Signature {
-    /// Get the data.
-    pub fn signed_data(&self) -> &[u8] {
-        match self {
-            Self::Console(data) | Self::Emulator(data) => data,
-        }
-    }
-
-    /// Length of the data to verify the signature against.
-    pub fn signed_data_length(&self, ticket_version: Version) -> usize {
-        match self {
-            Self::Console(_) => {
-                ticket_version.ticket_length() - (ticket_version.signature_length(self) + 16)
-            }
-
-            // The emulator only signs from 0x08 to 0xB0, skipping the first 8 bytes.
-            // This is the entirety of the `user_data` section.
-            Self::Emulator(_) => unimplemented!(),
-        }
-    }
-
-    /// Deserialize a signature from a byte slice.
-    ///
-    /// `RPCN` signatures have the ID `RPCN`.
-    /// All other signatures are considered `PSN` signatures.
-    pub fn from_bytes(id: [u8; 4], data: &[u8]) -> Self {
-        match &id {
-            b"RPCN" => Self::Emulator(data.to_vec()),
-            _ => Self::Console(data.to_vec()),
-        }
-    }
-}
 
 /// A ``PlayStation Network`` ticket for authenticating requests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -406,5 +308,94 @@ impl Ticket {
         }
 
         Ok(ticket)
+    }
+
+    /// Serialize the ticket to bytes and optionally sign it.
+    ///
+    /// Currently, only `RPCN` signatures (using P-224) are fully supported for creation.
+    pub fn to_bytes(
+        &self,
+        version: Version,
+        signing_key: Option<&ecdsa::SigningKey<NistP224>>,
+    ) -> Vec<u8> {
+        let mut serial_vec = self.serial.as_bytes().to_vec();
+        serial_vec.resize(0x14, 0);
+
+        let mut online_id = self.username.as_bytes().to_vec();
+        online_id.resize(0x20, 0);
+
+        let mut service_id = self.service_id.as_bytes().to_vec();
+        service_id.resize(0x18, 0);
+
+        let mut region = self.region.as_bytes().to_vec();
+        region.resize(4, 0);
+
+        let mut domain = self.domain.as_bytes().to_vec();
+        domain.resize(4, 0);
+
+        let mut user_data = vec![
+            TicketData::Binary(serial_vec),
+            TicketData::U32(self.issuer_id),
+            TicketData::Time(self.issued_at),
+            TicketData::Time(self.expires_at),
+            TicketData::U64(self.account_id),
+            TicketData::BString(online_id),
+            TicketData::Binary(region),
+            TicketData::BString(domain),
+            TicketData::Binary(service_id),
+            TicketData::U32(self.status),
+        ];
+
+        user_data.push(TicketData::Empty());
+        user_data.push(TicketData::Empty());
+
+        let user_blob = TicketData::Blob(0, user_data);
+
+        // P-224 signature is 56 bytes
+        let mut signature_bytes = vec![0u8; 56];
+
+        if let Some(key) = signing_key {
+            let mut user_rawdata = Vec::new();
+            user_blob.write(&mut user_rawdata);
+
+            let mut hasher = Sha224::new();
+            hasher.update(&user_rawdata);
+            let hash = hasher.finalize();
+
+            if let Ok(sig) = key.sign_prehash(&hash) {
+                let sig: ecdsa::Signature<NistP224> = sig;
+                signature_bytes = sig.to_bytes().to_vec();
+            }
+        }
+
+        let signature_blob = TicketData::Blob(
+            2,
+            vec![
+                TicketData::Binary(b"RPCN".to_vec()),
+                TicketData::Binary(signature_bytes),
+            ],
+        );
+
+        let mut ticket_blob = Vec::new();
+        ticket_blob.extend(&((version as u32) << 16).to_be_bytes());
+
+        let size: u32 = ((user_blob.len() + 4) + (signature_blob.len() + 4)) as u32;
+        ticket_blob.extend(&size.to_be_bytes());
+
+        user_blob.write(&mut ticket_blob);
+        signature_blob.write(&mut ticket_blob);
+
+        ticket_blob
+    }
+
+    /// Serialize the ticket and encode it as a base64 string.
+    pub fn to_base64(
+        &self,
+        version: Version,
+        signing_key: Option<&ecdsa::SigningKey<NistP224>>,
+    ) -> String {
+        let bytes = self.to_bytes(version, signing_key);
+        let engine = base64::engine::general_purpose::STANDARD;
+        engine.encode(bytes)
     }
 }
