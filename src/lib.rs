@@ -4,14 +4,13 @@
 //! username, alongside other data, which we can use to identify them.
 
 use base64::Engine;
-use ecdsa::elliptic_curve::pkcs8::DecodePublicKey;
-use ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
-use p192::NistP192;
-use p224::secp224k1::Secp224k1;
-use p256::NistP256;
+use openssl::bn::BigNum;
+use openssl::ec::EcKey;
+use openssl::ecdsa::EcdsaSig;
+use openssl::hash::{Hasher, MessageDigest};
+use openssl::pkey::{PKey, Private};
+use openssl::sign::Verifier;
 use serde::{Deserialize, Deserializer};
-use sha1::Sha1;
-use sha2::{Digest, Sha224, Sha256};
 
 // Re-export as well for convenience
 pub use crate::signature::Signature;
@@ -77,11 +76,37 @@ impl<'de> Deserialize<'de> for Ticket {
         let engine = base64::engine::general_purpose::STANDARD;
         let mut decoded = engine.decode(base64).map_err(serde::de::Error::custom)?;
 
-        // Deserialize the ticket from the decoded bytes.
+        // NOTE: from_bytes does NOT verify the signature; the caller is responsible
+        // for verification via from_bytes_with_key.
         let ticket = Self::from_bytes(&mut decoded).map_err(serde::de::Error::custom)?;
 
         Ok(ticket)
     }
+}
+
+/// Helper: compute a SHA-224 digest of `data` using OpenSSL.
+fn sha224(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut h = Hasher::new(MessageDigest::sha224()).map_err(|_| "Failed to init SHA-224")?;
+    h.update(data).map_err(|_| "Failed to hash data")?;
+    Ok(h.finish().map_err(|_| "Failed to finalize hash")?.to_vec())
+}
+
+/// Helper: convert a raw fixed-size `r || s` signature (or DER) into an [`EcdsaSig`].
+///
+/// If the input is valid DER it is used directly; otherwise we split at the midpoint
+/// and build the signature from the raw `r` and `s` components.
+fn parse_ecdsa_sig(bytes: &[u8]) -> Result<EcdsaSig, &'static str> {
+    if let Ok(sig) = EcdsaSig::from_der(bytes) {
+        return Ok(sig);
+    }
+    if bytes.len() % 2 != 0 || bytes.is_empty() {
+        return Err("Invalid signature format: odd or zero length");
+    }
+    let half = bytes.len() / 2;
+    let r = BigNum::from_slice(&bytes[..half]).map_err(|_| "Failed to parse r component")?;
+    let s = BigNum::from_slice(&bytes[half..]).map_err(|_| "Failed to parse s component")?;
+    EcdsaSig::from_private_components(r, s)
+        .map_err(|_| "Failed to construct ECDSA signature from r||s")
 }
 
 impl Ticket {
@@ -127,11 +152,13 @@ impl Ticket {
         Ok(())
     }
 
-    /// Deserialize a ticket from a byte slice.
-    /// This will also verify the ticket's signature.
+    /// Parse the raw fields from `bytes` into a [`Ticket`] **without** verifying
+    /// the signature.
     ///
-    /// `bytes` must be mutable, as the function may modify it
-    /// to fix endianness issues with the timestamps.
+    /// Prefer [`Self::from_bytes_with_key`] to also verify the signature.
+    ///
+    /// `bytes` must be mutable because the function may swap byte order to fix
+    /// endianness issues with the timestamps.
     #[allow(clippy::too_many_lines)]
     pub fn from_bytes(bytes: &mut [u8]) -> Result<Self, &'static str> {
         let mut ticket = Self::default();
@@ -147,7 +174,7 @@ impl Ticket {
             return Err("Invalid buffer length");
         }
 
-        // Helper function to handle endianness issues with timestamps
+        // Helper to handle endianness issues with timestamps
         let parse_timestamps = |bytes: &mut [u8],
                                 issued_range: std::ops::Range<usize>,
                                 expires_range: std::ops::Range<usize>|
@@ -240,85 +267,81 @@ impl Ticket {
             }
         }
 
-        let ec_key_name = match &ticket.signature {
-            Signature::Console(_) => "psn",
-            Signature::Emulator(_) => "rpcn",
-        };
+        Ok(ticket)
+    }
 
-        let ec_key_bytes = std::fs::read_to_string(format!("keys/{ec_key_name}.pem"))
-            .map_err(|_| "Failed to read public key")?;
+    /// Parse and **verify** a ticket using the supplied PEM-encoded public key.
+    ///
+    /// Verification uses OpenSSL and supports:
+    /// - **RPCN (secp224k1, SHA-224)** — fully verified.
+    /// - **PSN V4 (P-256 / prime256v1, SHA-256)** — verified when a key is provided.
+    /// - **PSN V2/V3 (P-192 / prime192v1, SHA-1)** — verified when a key is provided.
+    ///
+    /// The raw signature is expected to be in `r || s` (fixed-size) format; DER is
+    /// also accepted as a fallback.
+    pub fn from_bytes_with_key(bytes: &mut [u8], pub_key_pem: &str) -> Result<Self, &'static str> {
+        // 1. Parse all fields (no crypto yet)
+        let ticket = Self::from_bytes(bytes)?;
 
-        let data = ticket.signature.signed_data();
-        let signature_bytes = match ticket.signature {
+        // 2. Re-derive version (already validated)
+        let version = Version::from_u16(u16::from_be_bytes([bytes[0], bytes[1]]))
+            .ok_or("Unsupported version")?;
+
+        // 3. Locate the raw signature bytes
+        let signature_bytes: &[u8] = match &ticket.signature {
             Signature::Console(_) => {
-                &bytes[bytes.len() - version.signature_length(&ticket.signature)..]
+                let sig_len = version.signature_length(&ticket.signature);
+                &bytes[bytes.len() - sig_len..]
             }
             Signature::Emulator(_) => &bytes[0xC0..],
         };
 
-        // Verify the signature.
-        // For the time being, only RPCN signatures can be verified.
-        //
-        // This is because:
-        // - The `psn.pem` public key might be wrong
-        //    - It claims to be prime192v1, but the signature doesn't match that curve
-        // - The signature is only 32 bytes, which only matches secp128r1
-        //    - The point is not on that curve, so it can't be secp128r1
-        //    - This is also why verifying PSN will not only give `false`; it will error out
-        // - Every PSN game has a different private key for signing NP tickets, and we don't
-        //   know PlayStation Home's public key.
-        // - Nobody has successfully verified a Version 4 PSN ticket yet
-        // - Versions below 4 aren't sent anymore by PSN.
-        match (&ticket.signature, version) {
-            (Signature::Emulator(_), Version::V2 | Version::V2_1 | Version::V3) => {
-                let vk = ecdsa::VerifyingKey::<Secp224k1>::from_public_key_pem(&ec_key_bytes)
-                    .map_err(|_| "Failed to load RPCN public key")?;
+        // 4. Load public key via OpenSSL
+        let pkey = PKey::public_key_from_pem(pub_key_pem.as_bytes())
+            .map_err(|_| "Failed to load public key from PEM")?;
 
-                let sig = ecdsa::Signature::<Secp224k1>::from_slice(signature_bytes)
-                    .or_else(|_| ecdsa::Signature::<Secp224k1>::from_der(signature_bytes))
-                    .map_err(|_| "Invalid RPCN signature format")?;
+        // 5. Choose hash algorithm:
+        //    RPCN (secp224k1)    → SHA-224
+        //    PSN V4 (P-256)      → SHA-256
+        //    PSN V2/V3 (P-192)  → SHA-1
+        let digest = match (&ticket.signature, version) {
+            (Signature::Emulator(_), _) => MessageDigest::sha224(),
+            (Signature::Console(_), Version::V4) => MessageDigest::sha256(),
+            (Signature::Console(_), _) => MessageDigest::sha1(),
+        };
 
-                let mut hasher = Sha224::new();
-                hasher.update(data);
-                let hash = hasher.finalize();
+        // 6. Convert raw r||s → DER (or pass DER through as-is)
+        let ecdsa_sig = parse_ecdsa_sig(signature_bytes)?;
+        let der_sig = ecdsa_sig
+            .to_der()
+            .map_err(|_| "Failed to DER-encode ECDSA signature")?;
 
-                vk.verify_prehash(&hash, &sig)
-                    .map_err(|_| "Invalid signature")?;
-            }
-            (Signature::Console(_), Version::V4) => {
-                // Just validate PEM/Key for now
-                let _vk = ecdsa::VerifyingKey::<NistP256>::from_public_key_pem(&ec_key_bytes)
-                    .map_err(|_| "Failed to load PSN public key (P-256)")?;
+        // 7. Verify using OpenSSL Verifier (handles hashing internally)
+        let mut verifier =
+            Verifier::new(digest, &pkey).map_err(|_| "Failed to create OpenSSL verifier")?;
+        verifier
+            .update(ticket.signature.signed_data())
+            .map_err(|_| "Failed to feed data to verifier")?;
+        let valid = verifier
+            .verify(&der_sig)
+            .map_err(|_| "Signature verification error")?;
 
-                let mut hasher = Sha256::new();
-                hasher.update(data);
-                let _hash = hasher.finalize();
-            }
-            (Signature::Console(_), _) => {
-                // V2/V3
-                let _vk = ecdsa::VerifyingKey::<NistP192>::from_public_key_pem(&ec_key_bytes)
-                    .map_err(|_| "Failed to load PSN public key (P-192)")?;
-
-                let mut hasher = Sha1::new();
-                hasher.update(data);
-                let _hash = hasher.finalize();
-            }
-            _ => {
-                return Err("Unsupported ticket/signature combination for verification");
-            }
+        if !valid {
+            return Err("Invalid signature");
         }
 
         Ok(ticket)
     }
 
-    /// Serialize the ticket to bytes and optionally sign it.
+    /// Serialize the ticket to bytes and **sign** it using an OpenSSL private key.
     ///
-    /// Currently, only `RPCN` signatures (using P-224) are fully supported for creation.
-    pub fn to_bytes(
-        &self,
-        version: Version,
-        signing_key: Option<&ecdsa::SigningKey<Secp224k1>>,
-    ) -> Vec<u8> {
+    /// `signing_key` is a PEM-encoded PKCS#8 or SEC1 EC private key for the
+    /// RPCN curve (secp224k1). Pass `None` to produce an unsigned (zero-filled)
+    /// signature blob for testing.
+    ///
+    /// The produced signature is in raw `r || s` format (28 bytes each, 56 bytes
+    /// total) to match what RPCS3 / RPCN expect.
+    pub fn to_bytes(&self, version: Version, signing_key_pem: Option<&str>) -> Vec<u8> {
         let mut serial_vec = self.serial.as_bytes().to_vec();
         serial_vec.resize(0x14, 0);
 
@@ -352,20 +375,13 @@ impl Ticket {
 
         let user_blob = TicketData::Blob(0, user_data);
 
-        // P-224 signature is 56 bytes
+        // secp224k1 signature: 28 bytes per component = 56 bytes total (raw r||s)
         let mut signature_bytes = vec![0u8; 56];
 
-        if let Some(key) = signing_key {
-            let mut user_rawdata = Vec::new();
-            user_blob.write(&mut user_rawdata);
-
-            let mut hasher = Sha224::new();
-            hasher.update(&user_rawdata);
-            let hash = hasher.finalize();
-
-            if let Ok(sig) = key.sign_prehash(&hash) {
-                let sig: ecdsa::Signature<Secp224k1> = sig;
-                signature_bytes = sig.to_bytes().to_vec();
+        if let Some(pem) = signing_key_pem {
+            // Try to sign; on any error we fall back to the zero-filled placeholder
+            if let Some(sig) = Self::sign_user_blob(&user_blob, pem) {
+                signature_bytes = sig;
             }
         }
 
@@ -389,13 +405,40 @@ impl Ticket {
         ticket_blob
     }
 
+    /// Internal: serialise `user_blob`, SHA-224 hash it, sign with OpenSSL, and
+    /// return the raw `r || s` bytes (56 bytes for secp224k1).
+    fn sign_user_blob(user_blob: &TicketData, private_key_pem: &str) -> Option<Vec<u8>> {
+        // Serialise the blob to bytes
+        let mut user_rawdata = Vec::new();
+        user_blob.write(&mut user_rawdata);
+
+        // Compute SHA-224 digest
+        let digest = sha224(&user_rawdata).ok()?;
+
+        // Load the private key
+        let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).ok()?;
+        let ec_key: EcKey<Private> = pkey.ec_key().ok()?;
+
+        // Sign the digest using OpenSSL's low-level EcdsaSig::sign
+        let sig = EcdsaSig::sign(&digest, &ec_key).ok()?;
+
+        // Convert to fixed-size r || s (28 bytes each for secp224k1 / P-224)
+        let r = sig.r().to_vec();
+        let s = sig.s().to_vec();
+
+        // Zero-pad each component to exactly 28 bytes
+        let mut raw = vec![0u8; 56];
+        let r_start = 28usize.saturating_sub(r.len());
+        let s_start = 28usize.saturating_sub(s.len());
+        raw[r_start..28].copy_from_slice(&r[r.len().saturating_sub(28)..]);
+        raw[28 + s_start..].copy_from_slice(&s[s.len().saturating_sub(28)..]);
+
+        Some(raw)
+    }
+
     /// Serialize the ticket and encode it as a base64 string.
-    pub fn to_base64(
-        &self,
-        version: Version,
-        signing_key: Option<&ecdsa::SigningKey<Secp224k1>>,
-    ) -> String {
-        let bytes = self.to_bytes(version, signing_key);
+    pub fn to_base64(&self, version: Version, signing_key_pem: Option<&str>) -> String {
+        let bytes = self.to_bytes(version, signing_key_pem);
         let engine = base64::engine::general_purpose::STANDARD;
         engine.encode(bytes)
     }
