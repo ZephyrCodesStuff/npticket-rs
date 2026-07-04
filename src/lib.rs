@@ -7,7 +7,7 @@ use base64::Engine;
 use ecdsa::elliptic_curve::pkcs8::DecodePublicKey;
 use ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use p192::NistP192;
-use p224::NistP224;
+use p224::secp224k1::Secp224k1;
 use p256::NistP256;
 use serde::{Deserialize, Deserializer};
 use sha1::Sha1;
@@ -271,11 +271,11 @@ impl Ticket {
         // - Versions below 4 aren't sent anymore by PSN.
         match (&ticket.signature, version) {
             (Signature::Emulator(_), Version::V2 | Version::V2_1 | Version::V3) => {
-                let vk = ecdsa::VerifyingKey::<NistP224>::from_public_key_pem(&ec_key_bytes)
+                let vk = ecdsa::VerifyingKey::<Secp224k1>::from_public_key_pem(&ec_key_bytes)
                     .map_err(|_| "Failed to load RPCN public key")?;
 
-                let sig = ecdsa::Signature::<NistP224>::from_slice(signature_bytes)
-                    .or_else(|_| ecdsa::Signature::<NistP224>::from_der(signature_bytes))
+                let sig = ecdsa::Signature::<Secp224k1>::from_slice(signature_bytes)
+                    .or_else(|_| ecdsa::Signature::<Secp224k1>::from_der(signature_bytes))
                     .map_err(|_| "Invalid RPCN signature format")?;
 
                 let mut hasher = Sha224::new();
@@ -317,7 +317,7 @@ impl Ticket {
     pub fn to_bytes(
         &self,
         version: Version,
-        signing_key: Option<&ecdsa::SigningKey<NistP224>>,
+        signing_key: Option<&ecdsa::SigningKey<Secp224k1>>,
     ) -> Vec<u8> {
         let mut serial_vec = self.serial.as_bytes().to_vec();
         serial_vec.resize(0x14, 0);
@@ -364,7 +364,7 @@ impl Ticket {
             let hash = hasher.finalize();
 
             if let Ok(sig) = key.sign_prehash(&hash) {
-                let sig: ecdsa::Signature<NistP224> = sig;
+                let sig: ecdsa::Signature<Secp224k1> = sig;
                 signature_bytes = sig.to_bytes().to_vec();
             }
         }
@@ -393,7 +393,7 @@ impl Ticket {
     pub fn to_base64(
         &self,
         version: Version,
-        signing_key: Option<&ecdsa::SigningKey<NistP224>>,
+        signing_key: Option<&ecdsa::SigningKey<Secp224k1>>,
     ) -> String {
         let bytes = self.to_bytes(version, signing_key);
         let engine = base64::engine::general_purpose::STANDARD;
